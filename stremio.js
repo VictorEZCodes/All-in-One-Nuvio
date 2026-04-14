@@ -15,6 +15,7 @@
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const path = require("path");
 const fs = require("fs");
+const { execFile } = require("child_process");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -108,6 +109,8 @@ async function getTmdbMeta(tmdbId, mediaType) {
         );
         const data = await res.json();
         const meta = {
+            title: data.title || data.name || "",
+            original_title: data.original_title || data.original_name || "",
             original_language: data.original_language,
             genres: (data.genres || []).map((g) => g.id),
         };
@@ -158,6 +161,70 @@ function filterProvidersByContent(allProviders, relevantCategories) {
 }
 
 // ---------------------------------------------------------------------------
+// Stream title validation — reject false matches, accept branded/generic names
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine if a stream should be rejected based on title mismatch.
+ *
+ * Strategy:
+ * 1. Strip technical metadata (resolution, codecs, container, etc.) from the
+ *    stream title.
+ * 2. If fewer than 2 meaningful words remain, the title is just
+ *    provider branding / quality info — ACCEPT (it used the right TMDB ID).
+ * 3. Otherwise, compare what remains against the TMDB title using Dice
+ *    coefficient on character bigrams. This handles concatenated words,
+ *    partial matches, and word-order variations gracefully.
+ *
+ * Returns true if the stream should be REJECTED.
+ */
+function shouldRejectStream(streamTitle, tmdbTitle, tmdbOrigTitle) {
+    const noise = /\b(\d{3,4}p|[hx]\.?26[45]|aac|hevc|web[- ]?dl|blu[- ]?ray|hdr\d*|sdr|remux|atmos|dts|mkv|mp4|avi|multi|vf|vff|vo|vostfr|dual|server\s*\d*|auto|hls|hd|fhd|uhd|sd|full|stream|premium|standard|quality|original|low|mid|s\d{1,2}e?\d{0,3}|season\s*\d+|episode\s*\d+|hindi|english|tamil|telugu|french|spanish|japanese|korean|chinese|arabic|german|italian|portuguese|turkish)\b/gi;
+
+    // Strip everything that's clearly technical / language metadata
+    const stripped = streamTitle
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .replace(noise, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    // If nothing meaningful remains, it's a branded/generic name — ACCEPT
+    const words = stripped.split(/\s+/).filter((w) => w.length > 1);
+    if (words.length < 2) return false;
+
+    const clean = (s) => s.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+    const wanted = clean(tmdbTitle);
+    const wantedOrig = tmdbOrigTitle ? clean(tmdbOrigTitle) : "";
+
+    // Dice coefficient on character bigrams
+    const bigrams = (s) => {
+        const b = new Set();
+        for (let i = 0; i < s.length - 1; i++) b.add(s[i] + s[i + 1]);
+        return b;
+    };
+    const dice = (a, b) => {
+        if (!a.size || !b.size) return 0;
+        let overlap = 0;
+        for (const x of a) if (b.has(x)) overlap++;
+        return (2 * overlap) / (a.size + b.size);
+    };
+
+    const streamBigrams = bigrams(stripped.replace(/\s/g, ""));
+    const score = Math.max(
+        dice(streamBigrams, bigrams(wanted.replace(/\s/g, ""))),
+        wantedOrig ? dice(streamBigrams, bigrams(wantedOrig.replace(/\s/g, ""))) : 0
+    );
+
+    // Fast-path: stream title contains the full TMDB title as substring
+    const containsTitle =
+        stripped.includes(wanted) ||
+        (wantedOrig && stripped.includes(wantedOrig));
+
+    return !containsTitle && score < 0.45;
+}
+
+// ---------------------------------------------------------------------------
 // Load providers
 // ---------------------------------------------------------------------------
 
@@ -181,7 +248,14 @@ function loadProviders() {
         // if (scraper.id === "anime-sama") continue;
         // if (scraper.id === "hdmovie2") continue;
         // if (scraper.id === "isaidub") continue;
-        const skip = ["test", "test2", "anime-sama", "hdmovie2", "isaidub"];
+        // if (scraper.id === "moviebox") continue;
+        // if (scraper.id === "allmovieland") continue;
+        // if (scraper.id === "flixindia") continue; // Cloudflare blocked
+        // if (scraper.id === "dooflix") continue; // 403 blocked
+        // if (scraper.id === "embed69") continue; // 403 blocked
+        // if (scraper.id === "diziyou") continue; // 403 blocked
+        // if (scraper.id === "dramafull") continue; // dead/unreachable
+        const skip = ["test", "test2", "anime-sama", "hdmovie2", "isaidub", "moviebox", "allmovieland", "flixindia", "dooflix", "embed69", "diziyou", "dramafull"];
         if (skip.includes(scraper.id)) continue;
         if (filter && !filter.includes(scraper.id)) continue;
 
@@ -201,6 +275,7 @@ function loadProviders() {
                 id: scraper.id,
                 name: scraper.name,
                 types: scraper.supportedTypes, // ["movie", "tv"]
+                langs: scraper.contentLanguage || [], // ["en", "hi", etc.]
                 getStreams,
             });
             console.log(`[stremio] loaded provider: ${scraper.id}`);
@@ -250,17 +325,242 @@ async function imdbToTmdb(imdbId, type) {
 // Transform Nuvio stream → Stremio stream
 // ---------------------------------------------------------------------------
 
-function toStremioStream(nuvioStream, providerName) {
+// ---------------------------------------------------------------------------
+// Stream probing — detect actual audio tracks & embedded subs
+// ---------------------------------------------------------------------------
+
+// Check if ffprobe is available at startup
+let HAS_FFPROBE = false;
+try {
+    require("child_process").execSync("ffprobe -version", { stdio: "ignore" });
+    HAS_FFPROBE = true;
+    console.log("[stremio] ffprobe detected — audio probing enabled");
+} catch {
+    console.log("[stremio] ffprobe not found — using m3u8 parsing only");
+}
+
+/**
+ * Probe a stream URL with ffprobe to get real audio/subtitle tracks.
+ * Returns { audio: ["eng","hin"], subs: ["eng"], video: "1920x1080" } or null on failure.
+ */
+// Concurrency limiter — max N probes at once to avoid overwhelming the system
+function makeLimiter(concurrency) {
+    let running = 0;
+    const queue = [];
+    function next() {
+        if (queue.length === 0 || running >= concurrency) return;
+        running++;
+        const { fn, resolve } = queue.shift();
+        fn().then(resolve).finally(() => { running--; next(); });
+    }
+    return (fn) => new Promise((resolve) => { queue.push({ fn, resolve }); next(); });
+}
+const probeLimit = makeLimiter(20);
+
+function probeStream(url, headers) {
+    if (!HAS_FFPROBE) return Promise.resolve(null);
+    return probeLimit(() => new Promise((resolve) => {
+        const args = [
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-analyzeduration", "0",        // don't analyze duration — just read headers
+            "-probesize", "32768",           // 32KB — enough for container metadata
+            "-fflags", "+nobuffer",          // no buffering
+        ];
+
+        // Add headers for authenticated streams
+        if (headers && typeof headers === "object") {
+            const headerStr = Object.entries(headers)
+                .map(([k, v]) => `${k}: ${v}`)
+                .join("\r\n");
+            args.push("-headers", headerStr + "\r\n");
+        }
+
+        args.push(url);
+
+        execFile("ffprobe", args, { timeout: 3000 }, (err, stdout) => {
+            if (err) return resolve(null);
+            try {
+                const data = JSON.parse(stdout);
+                const streams = data.streams || [];
+
+                const audio = streams
+                    .filter((s) => s.codec_type === "audio")
+                    .map((s) => {
+                        const lang = s.tags?.language || s.tags?.LANGUAGE || "";
+                        const title = s.tags?.title || s.tags?.TITLE || "";
+                        const codec = s.codec_name || "";
+                        const ch = s.channels || 0;
+                        return { lang, title, codec, ch };
+                    });
+
+                const subs = streams
+                    .filter((s) => s.codec_type === "subtitle")
+                    .map((s) => {
+                        const lang = s.tags?.language || s.tags?.LANGUAGE || "";
+                        const title = s.tags?.title || s.tags?.TITLE || "";
+                        return { lang, title };
+                    });
+
+                const vid = streams.find((s) => s.codec_type === "video");
+                const video = vid ? `${vid.width}x${vid.height}` : "";
+
+                resolve({ audio, subs, video });
+            } catch {
+                resolve(null);
+            }
+        });
+    }));
+}
+
+/**
+ * For m3u8/HLS: fetch the master playlist and parse audio track info.
+ * Much faster than ffprobe — just a small text fetch.
+ */
+async function probeM3U8(url, headers) {
+    try {
+        const fetchHeaders = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            ...(headers || {}),
+        };
+        const res = await fetch(url, { headers: fetchHeaders, signal: AbortSignal.timeout(5000) });
+        const text = await res.text();
+
+        // Parse #EXT-X-MEDIA:TYPE=AUDIO lines
+        const audioTracks = [];
+        const mediaRegex = /#EXT-X-MEDIA:([^\n]+)/g;
+        let match;
+        while ((match = mediaRegex.exec(text)) !== null) {
+            const line = match[1];
+            if (!line.includes('TYPE=AUDIO')) continue;
+            const langMatch = line.match(/LANGUAGE="([^"]+)"/);
+            const nameMatch = line.match(/NAME="([^"]+)"/);
+            if (langMatch || nameMatch) {
+                audioTracks.push({
+                    lang: langMatch ? langMatch[1] : "",
+                    title: nameMatch ? nameMatch[1] : "",
+                    codec: "aac", ch: 2,
+                });
+            }
+        }
+
+        // Parse #EXT-X-MEDIA:TYPE=SUBTITLES lines
+        const subTracks = [];
+        const text2 = text;
+        const mediaRegex2 = /#EXT-X-MEDIA:([^\n]+)/g;
+        let match2;
+        while ((match2 = mediaRegex2.exec(text2)) !== null) {
+            const line = match2[1];
+            if (!line.includes('TYPE=SUBTITLES')) continue;
+            const langMatch = line.match(/LANGUAGE="([^"]+)"/);
+            const nameMatch = line.match(/NAME="([^"]+)"/);
+            if (langMatch || nameMatch) {
+                subTracks.push({
+                    lang: langMatch ? langMatch[1] : "",
+                    title: nameMatch ? nameMatch[1] : "",
+                });
+            }
+        }
+
+        if (audioTracks.length === 0 && subTracks.length === 0) return null;
+        return { audio: audioTracks, subs: subTracks, video: "" };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Probe a stream — picks the right method based on URL type.
+ */
+async function probeStreamAuto(url, headers) {
+    if (url.toLowerCase().includes(".m3u8")) {
+        // Try m3u8 parsing first (fast), fallback to ffprobe
+        const result = await probeM3U8(url, headers);
+        if (result && result.audio.length > 0) return result;
+    }
+    // ffprobe for direct files or m3u8 fallback
+    return probeStream(url, headers);
+}
+
+/**
+ * Format probe results into a readable string for the description.
+ */
+function formatProbeInfo(probe) {
+    if (!probe) return null;
+
+    const parts = [];
+
+    if (probe.audio.length > 0) {
+        const audioStr = probe.audio.map((a) => {
+            const lang = (a.lang || "?").toUpperCase().substring(0, 3);
+            const chStr = a.ch > 2 ? ` ${a.ch}.1ch` : "";
+            return `${lang}${chStr}`;
+        }).join(" + ");
+        parts.push(`Audio: ${audioStr}`);
+    }
+
+    if (probe.subs.length > 0) {
+        const subStr = probe.subs.map((s) =>
+            (s.lang || s.title || "?").toUpperCase().substring(0, 3)
+        ).join(", ");
+        parts.push(`Subs: ${subStr}`);
+    }
+
+    if (probe.video) parts.push(probe.video);
+
+    return parts.length > 0 ? parts.join(" | ") : null;
+}
+
+// ---------------------------------------------------------------------------
+// Transform Nuvio stream → Stremio stream
+// ---------------------------------------------------------------------------
+
+function toStremioStream(nuvioStream, providerName, probeInfo) {
     if (!nuvioStream || !nuvioStream.url) return null;
 
-    // Format the name line: "ProviderName  Quality"
-    // Stremio shows `name` as the bold heading, `description` below it
+    // Filter out low quality streams (480p and below)
+    const q = (nuvioStream.quality || "").toLowerCase();
+    if (/^(480|360|240)p?$/i.test(q) || q === "sd") return null;
+
+    // Also check probe resolution
+    if (probeInfo) {
+        const resMatch = probeInfo.match(/(\d{3,4})x(\d{3,4})/);
+        if (resMatch && parseInt(resMatch[2]) < 600) return null;
+    }
+
+    // Filter out French-only and Hindi-only audio streams
+    // Check 1: probe results (actual audio tracks)
+    if (probeInfo) {
+        const audioMatch = probeInfo.match(/Audio:\s*([^|]+)/);
+        if (audioMatch) {
+            const tracks = audioMatch[1].trim().toUpperCase();
+            const codes = tracks.split(/\s*\+\s*/);
+            if (codes.length > 0 && codes.every((c) => /^FRE|^FRA/.test(c.trim()))) return null;
+            if (codes.length > 0 && codes.every((c) => /^HIN/.test(c.trim()))) return null;
+        }
+    }
+    // Check 2: stream name/title text (when probe didn't detect audio)
+    if (!probeInfo || !probeInfo.includes("Audio:")) {
+        const text = `${nuvioStream.name || ""} ${nuvioStream.title || ""}`.toLowerCase();
+        const hasHindi = /hindi|🔊\s*hindi/.test(text);
+        const hasEnglish = /english|eng\b/.test(text);
+        const hasDual = /dual|multi/.test(text);
+        // If it mentions Hindi but not English and not dual/multi, skip it
+        if (hasHindi && !hasEnglish && !hasDual) return null;
+    }
+
+    // Format the name line
     const quality = nuvioStream.quality || "";
     const name = `${providerName}\n${quality}`;
 
-    // Description: size + title + format info
+    // Description: probe info + size + title + format
     const descParts = [];
-    if (nuvioStream.size) descParts.push(`${nuvioStream.size}`);
+
+    // Real audio/sub info from probing (top priority)
+    if (probeInfo) descParts.push(probeInfo);
+
+    if (nuvioStream.size) descParts.push(nuvioStream.size);
     if (nuvioStream.title) descParts.push(nuvioStream.title);
 
     // Detect format from URL
@@ -332,7 +632,18 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
+// Stream result cache — 30 minute TTL
+const CACHE_TTL = 30 * 60 * 1000;
+const streamCache = new Map();
+
 builder.defineStreamHandler(async ({ type, id }) => {
+    // Check cache first
+    const cached = streamCache.get(id);
+    if (cached && Date.now() - cached.ts < CACHE_TTL) {
+        console.log(`[stremio] cache hit for ${id} (${cached.data.streams.length} streams)`);
+        return cached.data;
+    }
+
     // Parse the Stremio ID: "tt1234567" for movies, "tt1234567:S:E" for series
     const parts = id.split(":");
     const imdbId = parts[0];
@@ -363,27 +674,82 @@ builder.defineStreamHandler(async ({ type, id }) => {
     //     `categories=[${[...categories]}] → ${relevantProviders.length}/${typeFiltered.length} providers`
     // );
 
+    // Get TMDB title for validating provider results
+    const tmdbMeta = await getTmdbMeta(tmdbId, mediaType);
+    const tmdbTitle = (tmdbMeta?.title || "").toLowerCase();
+    const tmdbOrigTitle = (tmdbMeta?.original_title || "").toLowerCase();
+
     // Query all providers that support this media type
     const relevantProviders = providers.filter((p) => p.types.includes(mediaType));
-    console.log(`[stremio] querying ${relevantProviders.length} providers`);
+    console.log(`[stremio] querying ${relevantProviders.length} providers (title: "${tmdbMeta?.title}")`);
 
     // Deadline-based approach: return whatever streams we have after
     // DEADLINE_MS, without waiting for slow providers. Each provider that
     // finishes pushes its results into the shared array immediately.
-    const DEADLINE_MS = 15000;
+    const DEADLINE_MS = 60000;
 
     const stremioStreams = [];
 
     const providerPromises = relevantProviders.map((provider) =>
         Promise.resolve()
             .then(() => provider.getStreams(tmdbId, mediaType, season, episode))
-            .then((streams) => {
-                if (!Array.isArray(streams)) return;
-                for (const s of streams) {
-                    const converted = toStremioStream(s, provider.name);
-                    if (converted) stremioStreams.push(converted);
+            .then(async (streams) => {
+                if (!Array.isArray(streams) || streams.length === 0) return;
+
+                // Probe all streams from this provider in parallel
+                const probeResults = await Promise.allSettled(
+                    streams.map((s) =>
+                        s.url
+                            ? probeStreamAuto(s.url, s.headers).catch(() => null)
+                            : Promise.resolve(null)
+                    )
+                );
+
+                let accepted = 0;
+                for (let i = 0; i < streams.length; i++) {
+                    const s = streams[i];
+
+                    // Validate 1: title check — reject wrong content (e.g. "Hana Kimi" for "The Boys")
+                    if (tmdbTitle && s.title && shouldRejectStream(s.title, tmdbTitle, tmdbOrigTitle)) {
+                        console.log(`[stremio] ${provider.id} REJECTED (title): "${s.title}" doesn't match "${tmdbMeta.title}"`);
+                        continue;
+                    }
+
+                    // Validate 2: language cross-check
+                    // If a provider doesn't list the content's language (from TMDB),
+                    // only keep the stream if its title clearly contains the content name.
+                    // e.g. Kisskh [ko] returning "Kisskh HLS" for an English show → reject.
+                    // But Kisskh returning "The Boys" for The Boys → keep (title matches).
+                    if (tmdbMeta && provider.langs.length > 0) {
+                        const contentLang = tmdbMeta.original_language;
+                        const providerSupportsLang = provider.langs.includes(contentLang) || provider.langs.includes("en");
+                        if (!providerSupportsLang) {
+                            // Provider doesn't serve this language.
+                            // Check if stream title actually contains the content name
+                            const streamText = (s.title || s.name || "").toLowerCase();
+                            const wantedClean = tmdbTitle.replace(/[^a-z0-9\s]/g, "");
+                            const origClean = tmdbOrigTitle ? tmdbOrigTitle.replace(/[^a-z0-9\s]/g, "") : "";
+                            const titleMatches = streamText.includes(wantedClean) ||
+                                (origClean && streamText.includes(origClean));
+                            if (!titleMatches) {
+                                console.log(`[stremio] ${provider.id} REJECTED (lang): [${provider.langs}] doesn't cover "${contentLang}", title "${s.title || s.name}" doesn't confirm match`);
+                                continue;
+                            }
+                        }
+                    }
+
+                    const probe =
+                        probeResults[i]?.status === "fulfilled"
+                            ? probeResults[i].value
+                            : null;
+                    const probeInfo = formatProbeInfo(probe);
+                    const converted = toStremioStream(s, provider.name, probeInfo);
+                    if (converted) {
+                        stremioStreams.push(converted);
+                        accepted++;
+                    }
                 }
-                console.log(`[stremio] ${provider.id} returned ${streams.length} stream(s)`);
+                console.log(`[stremio] ${provider.id} returned ${streams.length} stream(s), accepted ${accepted}`);
             })
             .catch((err) => {
                 console.warn(`[stremio] ${provider.id} failed: ${err.message}`);
@@ -397,11 +763,44 @@ builder.defineStreamHandler(async ({ type, id }) => {
         new Promise((resolve) => setTimeout(resolve, DEADLINE_MS)),
     ]);
 
+    // Sort streams by quality: 4K > 2160p > 1080p > 720p > Auto > unknown
+    const qualityOrder = (stream) => {
+        const q = (stream.name || "").toLowerCase();
+        const desc = (stream.description || "").toLowerCase();
+        const all = q + " " + desc;
+
+        // Check for resolution in probe info (e.g. "1920x1080")
+        const resMatch = all.match(/(\d{3,4})x(\d{3,4})/);
+        if (resMatch) return parseInt(resMatch[2]);
+
+        // Check quality label
+        if (/4k|2160/i.test(all)) return 2160;
+        if (/1080/i.test(all)) return 1080;
+        if (/720/i.test(all)) return 720;
+        if (/auto/i.test(all)) return 700;
+        return 500;
+    };
+
+    stremioStreams.sort((a, b) => qualityOrder(b) - qualityOrder(a));
+
+    // Deduplicate — same URL from different providers is the same file
+    const seenUrls = new Set();
+    const deduped = stremioStreams.filter((s) => {
+        if (seenUrls.has(s.url)) return false;
+        seenUrls.add(s.url);
+        return true;
+    });
+
     console.log(
-        `[stremio] returning ${stremioStreams.length} streams for ${imdbId}`
+        `[stremio] returning ${deduped.length} streams for ${imdbId} (${stremioStreams.length - deduped.length} dupes removed)`
     );
 
-    return { streams: stremioStreams };
+    const result = { streams: deduped };
+
+    // Cache the result for 30 minutes
+    streamCache.set(id, { data: result, ts: Date.now() });
+
+    return result;
 });
 
 // ---------------------------------------------------------------------------
