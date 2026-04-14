@@ -573,7 +573,20 @@
       "enabled": true,
       "formats": ["mp4", "mkv", "m3u8"],
       "logo": "https://dramafull.cc/favicon.ico",
-      "contentLanguage": ["en", "ko", "zh", "ja"] 
+      "contentLanguage": ["en", "ko", "zh", "ja"]
+    },
+    {
+      "id": "vidsrc",
+      "name": "VidSrc",
+      "description": "Multi-server streaming via vsrc.su with 9 server mirrors",
+      "version": "1.0.0",
+      "author": "GlitchLabs",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/vidsrc.js",
+      "enabled": true,
+      "formats": ["m3u8"],
+      "logo": "https://i.postimg.cc/tJP8zc5K/vixsrc.png",
+      "contentLanguage": ["en"]
     }
   ]
 }
